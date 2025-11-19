@@ -1,6 +1,8 @@
 import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { Product, User } from '../types';
 import * as XLSX from 'xlsx'; // Import the xlsx library
+import translateTexts from '../services/translationService'; // Import translation service
+import { containsArabic } from '../utils/textUtils'; // Import new utility
 
 interface SupplierDashboardProps {
   currentUser: User;
@@ -8,6 +10,20 @@ interface SupplierDashboardProps {
   onAddProduct: (product: Omit<Product, 'id' | 'shopId' | 'shopName'>) => void;
   onUpdateProduct: (product: Product) => void;
   onDeleteProduct: (productId: string) => void;
+}
+
+interface NormalizedProductData {
+  Category_Arabic: string;
+  Category_English: string;
+  ItemName_Arabic: string;
+  ItemName_English: string;
+  Info_Arabic: string;
+  Info_English: string;
+  CarCompany: string;
+  CarModel: string;
+  CarInfo: string;
+  Brand: string;
+  OEM_Number: string;
 }
 
 const SupplierDashboard: React.FC<SupplierDashboardProps> = ({
@@ -19,6 +35,8 @@ const SupplierDashboard: React.FC<SupplierDashboardProps> = ({
 }) => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const normalizeFileInputRef = useRef<HTMLInputElement>(null);
+
 
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [editForm, setEditForm] = useState({
@@ -35,10 +53,19 @@ const SupplierDashboard: React.FC<SupplierDashboardProps> = ({
     quantityAvailable: '',
   });
 
-  // States for upload feedback
+  // States for standard upload feedback
   const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'success' | 'error'>('idle');
   const [uploadFeedbackMessage, setUploadFeedbackMessage] = useState<string | null>(null);
   const [uploadWarnings, setUploadWarnings] = useState<string[]>([]);
+
+  // States for normalization feedback
+  const [isNormalizing, setIsNormalizing] = useState<boolean>(false);
+  const [normalizedOutputData, setNormalizedOutputData] = useState<NormalizedProductData[] | null>(null);
+  const [normalizationFeedbackMessage, setNormalizationFeedbackMessage] = useState<string | null>(null);
+  const [normalizationWarnings, setNormalizationWarnings] = useState<string[]>([]);
+  const [normalizationError, setNormalizationError] = useState<string | null>(null);
+  const [normalizeFile, setNormalizeFile] = useState<File | null>(null);
+
 
   // Populate edit form when editingProduct changes
   useEffect(() => {
@@ -311,6 +338,224 @@ const SupplierDashboard: React.FC<SupplierDashboardProps> = ({
     }
   };
 
+  // --- Normalization Functions ---
+  const handleNormalizeFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    if (event.target.files && event.target.files[0]) {
+      const file = event.target.files[0];
+      const fileName = file.name.toLowerCase();
+      if (fileName.endsWith('.xlsx') || fileName.endsWith('.xlsm')) {
+        setNormalizeFile(file);
+        setNormalizedOutputData(null); // Clear previous results
+        setNormalizationFeedbackMessage(null);
+        setNormalizationWarnings([]);
+        setNormalizationError(null);
+      } else {
+        setNormalizeFile(null);
+        setNormalizationError('Invalid file type. Please upload an .xlsx or .xlsm file.');
+        if (normalizeFileInputRef.current) {
+          normalizeFileInputRef.current.value = '';
+        }
+      }
+    } else {
+      setNormalizeFile(null);
+      setNormalizedOutputData(null);
+      setNormalizationFeedbackMessage(null);
+      setNormalizationWarnings([]);
+      setNormalizationError(null);
+    }
+  };
+
+  const handleNormalizeAndDownload = useCallback(async () => {
+    if (!normalizeFile) {
+      setNormalizationError('Please select an Excel file (.xlsx or .xlsm) to normalize.');
+      return;
+    }
+
+    setIsNormalizing(true);
+    setNormalizedOutputData(null);
+    setNormalizationFeedbackMessage('Reading and processing Excel file...');
+    setNormalizationWarnings([]);
+    setNormalizationError(null);
+
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      try {
+        const data = new Uint8Array(e.target?.result as ArrayBuffer);
+        const workbook = XLSX.read(data, { type: 'array' });
+        const sheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[sheetName];
+        const rawData: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+
+        if (!rawData || rawData.length < 2) {
+          setNormalizationError('No valid data found in the Excel sheet. Ensure it has a header and product rows.');
+          setIsNormalizing(false);
+          return;
+        }
+
+        const headerRow = rawData[0].map(h => typeof h === 'string' ? h.trim() : '');
+        const expectedInputHeaders = [
+          'Category', 'Item Name', 'Info', 'Car Company', 'Car Model', 'Car Info', 'Brand', 'OEM Number'
+        ];
+        const inputHeaderMap: { [key: string]: string } = {
+          'Category': 'Category',
+          'Item Name': 'ItemName',
+          'Info': 'Info',
+          'Car Company': 'CarCompany',
+          'Car Model': 'CarModel',
+          'Car Info': 'CarInfo',
+          'Brand': 'Brand',
+          'OEM Number': 'OEM_Number',
+        };
+
+        const headerIndices: { [key: string]: number } = {};
+        let missingHeaderCount = 0;
+        expectedInputHeaders.forEach(expectedH => {
+          const index = headerRow.findIndex(h => h.toLowerCase() === expectedH.toLowerCase());
+          if (index === -1) {
+            setNormalizationWarnings(prev => [...prev, `Missing expected column: "${expectedH}".`]);
+            missingHeaderCount++;
+          } else {
+            headerIndices[inputHeaderMap[expectedH]] = index;
+          }
+        });
+
+        if (missingHeaderCount > 0) {
+          setNormalizationError(`The Excel file is missing ${missingHeaderCount} required header column(s) for normalization. Please ensure all columns (${expectedInputHeaders.join(', ')}) are present and correctly named.`);
+          setIsNormalizing(false);
+          return;
+        }
+
+        const itemsToTranslate: { id: string; text: string; originalColumn: string; rowIndex: number }[] = [];
+        const processedRows: any[] = [];
+        let translationIdCounter = 0;
+        // Fix: Declare fieldsToTranslate outside the conditional translation block
+        const fieldsToTranslate = ['Category', 'ItemName', 'Info'];
+
+        for (let i = 1; i < rawData.length; i++) {
+          const row = rawData[i];
+          if (!row || row.filter(cell => cell !== undefined && cell !== null && String(cell).trim() !== '').length === 0) {
+            setNormalizationWarnings(prev => [...prev, `Row ${i + 1}: Skipping empty row.`]);
+            continue;
+          }
+
+          const productEntry: any = {};
+          let rowHasCriticalError = false;
+
+          for (const key in inputHeaderMap) {
+            const propName = inputHeaderMap[key];
+            const colIndex = headerIndices[propName];
+            productEntry[propName] = String(row[colIndex] || '').trim();
+          }
+
+          // Collect texts for translation
+          for (const field of fieldsToTranslate) {
+            const originalText = productEntry[field];
+            if (originalText && containsArabic(originalText)) {
+              const id = `t-${translationIdCounter++}`;
+              itemsToTranslate.push({ id, text: originalText, originalColumn: field, rowIndex: i - 1 });
+            }
+          }
+          processedRows.push(productEntry);
+        }
+
+        setNormalizationFeedbackMessage(`Found ${processedRows.length} valid rows. Translating Arabic text...`);
+
+        let translatedResultsMap = new Map<string, string>();
+        if (itemsToTranslate.length > 0) {
+          try {
+            const translations = await translateTexts(itemsToTranslate.map(item => ({ id: item.id, text: item.text })), 'en');
+            translations.forEach(t => translatedResultsMap.set(t.id, t.translatedText));
+          } catch (translationError) {
+            console.error('Translation failed:', translationError);
+            setNormalizationError(`Failed to translate some texts: ${(translationError as Error).message}`);
+            // Continue processing with untranslated originals for robustness
+          }
+        }
+
+        const finalNormalizedData: NormalizedProductData[] = processedRows.map((p, index) => {
+          const newEntry: NormalizedProductData = {
+            Category_Arabic: p.Category,
+            Category_English: p.Category, // Default to Arabic if no translation or already English
+            ItemName_Arabic: p.ItemName,
+            ItemName_English: p.ItemName,
+            Info_Arabic: p.Info,
+            Info_English: p.Info,
+            CarCompany: p.CarCompany,
+            CarModel: p.CarModel,
+            CarInfo: p.CarInfo,
+            Brand: p.Brand,
+            OEM_Number: p.OEM_Number,
+          };
+
+          // Apply translations back
+          fieldsToTranslate.forEach(field => {
+            const originalText = p[field];
+            if (originalText && containsArabic(originalText)) {
+              const translationItem = itemsToTranslate.find(item => item.rowIndex === index && item.originalColumn === field);
+              if (translationItem) {
+                const translatedText = translatedResultsMap.get(translationItem.id);
+                if (translatedText) {
+                  (newEntry as any)[`${field}_English`] = translatedText;
+                }
+              }
+            }
+          });
+          return newEntry;
+        });
+
+        if (finalNormalizedData.length > 0) {
+          setNormalizedOutputData(finalNormalizedData);
+          setNormalizationFeedbackMessage(`Normalization complete. ${finalNormalizedData.length} products processed. Ready for download.`);
+        } else {
+          setNormalizationError('No valid products could be normalized from the file.');
+        }
+
+      } catch (error) {
+        console.error('Error during normalization:', error);
+        setNormalizationError(`Error reading or processing Excel file: ${(error as Error).message}. Please ensure it's a valid .xlsx or .xlsm file and follows the specified format.`);
+      } finally {
+        setIsNormalizing(false);
+        if (normalizeFileInputRef.current) {
+          normalizeFileInputRef.current.value = ''; // Clear file input
+        }
+      }
+    };
+    reader.onerror = () => {
+      setNormalizationError('Error reading file. Please try again.');
+      setIsNormalizing(false);
+      if (normalizeFileInputRef.current) {
+        normalizeFileInputRef.current.value = '';
+      }
+    };
+    reader.readAsArrayBuffer(normalizeFile);
+  }, [normalizeFile]);
+
+  const handleDownloadJson = useCallback(() => {
+    if (normalizedOutputData) {
+      const filename = `normalized_autoparts_data_${new Date().toISOString().slice(0, 10)}.json`;
+      const jsonStr = JSON.stringify(normalizedOutputData, null, 2);
+      const blob = new Blob([jsonStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+  }, [normalizedOutputData]);
+
+  const handleDownloadCsv = useCallback(() => {
+    if (normalizedOutputData) {
+      const filename = `normalized_autoparts_data_${new Date().toISOString().slice(0, 10)}.csv`;
+      const ws = XLSX.utils.json_to_sheet(normalizedOutputData);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Normalized Data');
+      XLSX.writeFile(wb, filename);
+    }
+  }, [normalizedOutputData]);
+
   return (
     <div className="container mx-auto my-8 p-6 bg-white rounded-lg shadow-xl">
       <h2 className="text-3xl font-bold text-blue-700 mb-6 border-b pb-4">
@@ -476,8 +721,8 @@ const SupplierDashboard: React.FC<SupplierDashboardProps> = ({
           </>
         )}
 
-        {/* Excel Upload Section */}
-        <h3 className="text-2xl font-semibold text-gray-800 mb-4">Upload New Products (Excel .xlsx or .xlsm)</h3>
+        {/* Existing Excel Upload Section (for adding to app's products) */}
+        <h3 className="text-2xl font-semibold text-gray-800 mb-4 mt-8">Upload New Products to My Shop (Excel .xlsx or .xlsm)</h3>
         <p className="text-gray-600 mb-4">
           Upload an Excel file (.xlsx or .xlsm) with your product data. The first sheet should contain the following 8 columns in order:
           <br />
@@ -490,7 +735,7 @@ const SupplierDashboard: React.FC<SupplierDashboardProps> = ({
           <span className="font-semibold text-red-600">Important:</span> Ensure numerical values (Year, Price, Stock) are correctly formatted in Excel. If a description contains a comma, enclose the entire cell content in double quotes (e.g., "Shock absorber, gas-charged").
         </p>
 
-        <div className="flex items-center space-x-4 mb-4">
+        <div className="flex items-center space-x-4 mb-8">
           <label htmlFor="excel-upload" className="block text-sm font-medium text-gray-700 sr-only">Upload Excel File</label>
           <input
             type="file"
@@ -524,7 +769,7 @@ const SupplierDashboard: React.FC<SupplierDashboardProps> = ({
                 Uploading...
               </span>
             ) : (
-              'Upload Products'
+              'Add Products to Shop'
             )}
           </button>
         </div>
@@ -553,7 +798,115 @@ const SupplierDashboard: React.FC<SupplierDashboardProps> = ({
           </details>
         )}
 
-        <h3 className="text-2xl font-semibold text-gray-800 mb-4">My Current Products ({myProducts.length})</h3>
+        {/* New Section: Normalize Auto Parts Data */}
+        <div className="mt-12 border-t pt-8 border-gray-200">
+          <h3 className="text-2xl font-semibold text-gray-800 mb-4">Normalize and Download Auto Parts Data (Arabic/English)</h3>
+          <p className="text-gray-600 mb-4">
+            Upload an Excel file (.xlsx or .xlsm) with mixed Arabic and English auto parts data.
+            The system will detect Arabic text in key fields, translate it to English, and
+            output a structured file with both Arabic and English versions for easy search and database import.
+          </p>
+          <p className="text-gray-600 mb-4">
+            Expected columns (order doesn't strictly matter but names must match):
+            <br />
+            <code className="bg-gray-100 p-1 rounded-sm text-sm block my-2">
+              Category, Item Name, Info, Car Company, Car Model, Car Info, Brand, OEM Number
+            </code>
+            <br />
+            <span className="font-semibold text-red-600">Note:</span> Brand names, car models, and OEM numbers will not be translated. Translations will focus on descriptive fields like Category, Item Name, and Info.
+          </p>
+
+          <div className="flex items-center space-x-4 mb-4">
+            <label htmlFor="normalize-excel-upload" className="block text-sm font-medium text-gray-700 sr-only">Upload Excel File for Normalization</label>
+            <input
+              type="file"
+              id="normalize-excel-upload"
+              ref={normalizeFileInputRef}
+              accept=".xlsx, .xlsm"
+              onChange={handleNormalizeFileChange}
+              className="block w-full text-sm text-gray-500
+                         file:mr-4 file:py-2 file:px-4
+                         file:rounded-full file:border-0
+                         file:text-sm file:font-semibold
+                         file:bg-purple-50 file:text-purple-700
+                         hover:file:bg-purple-100"
+              aria-label="Upload Excel file for normalization"
+            />
+            <button
+              onClick={handleNormalizeAndDownload}
+              disabled={!normalizeFile || isNormalizing}
+              className={`px-6 py-2 rounded-md font-semibold shadow-sm transition-colors duration-300
+                          ${!normalizeFile || isNormalizing
+                            ? 'bg-gray-400 text-gray-700 cursor-not-allowed'
+                            : 'bg-purple-600 hover:bg-purple-700 text-white'}`}
+              aria-disabled={!normalizeFile || isNormalizing}
+            >
+              {isNormalizing ? (
+                <span className="flex items-center">
+                  <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                  Normalizing...
+                </span>
+              ) : (
+                'Normalize Data'
+              )}
+            </button>
+          </div>
+
+          {normalizationFeedbackMessage && (
+            <div
+              className={`p-4 rounded-md text-sm mb-4 ${
+                !normalizationError ? 'bg-blue-100 text-blue-800' : 'bg-red-100 text-red-800'
+              }`}
+              role={normalizationError ? 'alert' : 'status'}
+            >
+              {normalizationFeedbackMessage}
+            </div>
+          )}
+
+          {normalizationError && (
+             <div className="p-4 rounded-md text-sm mb-4 bg-red-100 text-red-800" role="alert">
+               Error: {normalizationError}
+             </div>
+          )}
+
+          {normalizationWarnings.length > 0 && (
+            <details className="bg-yellow-50 border border-yellow-200 text-yellow-800 p-4 rounded-md mb-8">
+              <summary className="font-semibold cursor-pointer">
+                {normalizationWarnings.length} Warnings during normalization (click to expand)
+              </summary>
+              <ul className="list-disc list-inside mt-2 space-y-1">
+                {normalizationWarnings.map((warning, index) => (
+                  <li key={index}>{warning}</li>
+                ))}
+              </ul>
+            </details>
+          )}
+
+          {normalizedOutputData && (
+            <div className="mt-6 flex space-x-4">
+              <button
+                onClick={handleDownloadJson}
+                className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-md shadow-sm transition-colors duration-300"
+                aria-label="Download normalized data as JSON"
+              >
+                Download JSON
+              </button>
+              <button
+                onClick={handleDownloadCsv}
+                className="px-6 py-2 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-md shadow-sm transition-colors duration-300"
+                aria-label="Download normalized data as CSV"
+              >
+                Download CSV
+              </button>
+            </div>
+          )}
+        </div>
+
+
+        <h3 className="text-2xl font-semibold text-gray-800 mb-4 mt-8">My Current Products ({myProducts.length})</h3>
         {myProducts.length === 0 ? (
           <p className="text-gray-600">You haven't added any products yet. Upload an Excel file to get started!</p>
         ) : (
