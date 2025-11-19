@@ -4,12 +4,19 @@
   "private": true,
   "homepage": "https://<YOUR_GITHUB_USERNAME>.github.io/<YOUR_REPO_NAME>",
   "scripts": {
+    "dev": "vite",
     "build": "tsc --outDir dist",
     "predeploy": "npm run build",
     "deploy": "gh-pages -d dist"
   },
   "devDependencies": {
+    "@vitejs/plugin-react": "^5.1.1",
     "gh-pages": "^6.1.1",
-    "typescript": "^5.5.3"
+    "typescript": "^5.5.3",
+    "vite": "^7.2.2"
+  },
+  "dependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
   }
 }
